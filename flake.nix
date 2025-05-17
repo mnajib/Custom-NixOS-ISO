@@ -84,6 +84,9 @@
           swtpm # TPM emulation
         ];
 
+        #
+        # NOTE: alias only work with 'nix develop' not with direnv.
+        #
         shellHook = ''
           export PS1="[L$SHLVL] $PS1"
 
@@ -94,23 +97,30 @@
           echo "------------------------------------------------"
 
           echo -e "\033[1;34mAvailable commands:\033[0m"
-          echo "  build-iso    - Build the customized ISO image"
-          echo "  run-vm       - Start the ISO in QEMU VM"
-          echo "  format       - Format Nix files"
-          echo "  lint         - Check for Nix code issues"
-          echo "  clean        - Remove build artifacts"
+          #echo "  build-iso    - Build the customized ISO image"
+          #echo "  run-vm       - Start the ISO in QEMU VM"
+          #echo "  format       - Format Nix files"
+          #echo "  lint         - Check for Nix code issues"
+          #echo "  clean        - Remove build artifacts"
 
-          echo -e "\n\033[1;34mQuick Start:\033[0m"
-          echo "  1. First build:     nix build .#iso"
-          echo "  2. Then run VM:     nix run .#vm"
-          echo "  3. Format configs:  nix develop -c format"
+          echo "  Build ISO:         nix build .#iso"
+          echo "  Create Disks:      nix run .#create-drives"
+          echo "  Start VM (ISO):    nix run .#vm-iso"
+          echo "  Start VM (Disk):   nix run .#vm-disk"
+          echo "  Clean ISO:         nix run .#clean-iso"
+          echo "  Clean Disks:       nix run .#clean-disks"
 
-          echo -e "\n\033[1;33mTIP:\033[0m These aliases work in the dev shell:"
-          echo "  build-iso = nix build .#iso"
-          echo "  run-vm    = nix run .#vm"
-          echo "  format    = nixpkgs-fmt flake.nix && statix ."
-          echo "  lint      = statix check . && deadnix ."
-          echo "  clean     = rm -f result && echo 'Cleaned!'"
+          #echo -e "\n\033[1;34mQuick Start:\033[0m"
+          #echo "  1. First build:     nix build .#iso"
+          #echo "  2. Then run VM:     nix run .#vm"
+          #echo "  3. Format configs:  nix develop -c format"
+
+          #echo -e "\n\033[1;33mTIP:\033[0m These aliases work in the dev shell:"
+          #echo "  build-iso = nix build .#iso"
+          #echo "  run-vm    = nix run .#vm"
+          #echo "  format    = nixpkgs-fmt flake.nix && statix ."
+          #echo "  lint      = statix check . && deadnix ."
+          #echo "  clean     = rm -f result && echo 'Cleaned!'"
 
           # Define check-kvm function
           check-kvm() {
@@ -187,12 +197,16 @@
             # ISO image configuration
             isoImage = {
               #isoName = lib.mkDefault "najib-nixos-gnome-installer.iso";
-              #isoName = lib.mkForce "nixos-najib-gnome-installer.iso";
+              isoName = lib.mkForce "nixos-custom.iso";
               makeEfiBootable = true;
               makeUsbBootable = true;
             };
 
-            networking.hostName = "najib-nixos";
+            networking.hostName = "nixos-custom-iso";
+            networking.hostId = builtins.substring 0 8 (
+              #builtins.hashString "sha256" config.networking.hostName
+              builtins.hashString "sha256" "custom-iso"
+            );
 
             # Embed flake in ISO
             environment.etc."nixos-flake".source = self.outPath;
@@ -307,8 +321,93 @@
 
 
       #----------------------------------------------------------------------------
+      # VM Drive Management
+      #----------------------------------------------------------------------------
+      packages.x86_64-linux.vm-drives = let
+        pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      in pkgs.writeShellScriptBin "create-vm-drives" ''
+        set -euo pipefail
+        DRIVE_DIR="./vm-drives"
+        mkdir -p "$DRIVE_DIR"
+
+        # Create fresh drives (20GB each)
+        ${pkgs.qemu}/bin/qemu-img create -f qcow2 "$DRIVE_DIR/disk1.qcow2" 20G
+        ${pkgs.qemu}/bin/qemu-img create -f qcow2 "$DRIVE_DIR/disk2.qcow2" 20G
+
+        echo "VM drives created in: $DRIVE_DIR"
+      '';
+
+
+      #----------------------------------------------------------------------------
+      # VM Control Scripts
+      #----------------------------------------------------------------------------
+      packages.x86_64-linux.vm-iso = let
+        pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      in pkgs.writeShellScriptBin "vm-iso" ''
+        set -euo pipefail
+        ISO_PATH="./result/iso/nixos-custom.iso"
+        [ -f "$ISO_PATH" ] || { echo "ISO not found! Build with: nix build .#iso"; exit 1; }
+
+        DRIVE_DIR="./vm-drives"
+        [ -f "$DRIVE_DIR/disk1.qcow2" ] || nix run .#create-drives
+
+        ${pkgs.qemu}/bin/qemu-system-x86_64 \
+          -machine accel=kvm,type=q35 \
+          -cpu host -smp 2 -m 4096 \
+          -drive file="$DRIVE_DIR/disk1.qcow2",if=virtio,format=qcow2 \
+          -drive file="$DRIVE_DIR/disk2.qcow2",if=virtio,format=qcow2 \
+          -cdrom "$ISO_PATH" -boot d \
+          -nic user,model=virtio-net-pci \
+          -usb -device usb-tablet \
+          -name "NixOS-ISO-Boot" \
+          -display gtk
+      '';
+
+
+      packages.x86_64-linux.vm-disk = let
+        pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      in pkgs.writeShellScriptBin "vm-disk" ''
+        set -euo pipefail
+        DRIVE_DIR="./vm-drives"
+        [ -f "$DRIVE_DIR/disk1.qcow2" ] || { echo "Drives not found! Create with: nix run .#create-drives"; exit 1; }
+
+        ${pkgs.qemu}/bin/qemu-system-x86_64 \
+          -machine accel=kvm,type=q35 \
+          -cpu host -smp 2 -m 4096 \
+          -drive file="$DRIVE_DIR/disk1.qcow2",if=virtio,format=qcow2 \
+          -drive file="$DRIVE_DIR/disk2.qcow2",if=virtio,format=qcow2 \
+          -nic user,model=virtio-net-pci \
+          -usb -device usb-tablet \
+          -name "NixOS-Disk-Boot" \
+          -display gtk
+      '';
+
+
+      #----------------------------------------------------------------------------
+      # Cleanup Commands
+      #----------------------------------------------------------------------------
+      packages.x86_64-linux.clean-iso = let
+        pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      in pkgs.writeShellScriptBin "clean-iso" ''
+        rm -f result && echo "ISO build artifacts removed"
+      '';
+
+      packages.x86_64-linux.clean-disks = let
+        pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      in pkgs.writeShellScriptBin "clean-disks" ''
+        rm -f ./vm-drives/*.qcow2 && echo "VM drives removed"
+      '';
+      #----------------------------------------------------------------------------
+
+
+      #----------------------------------------------------------------------------
       # Configuration for QEMU VM
       #----------------------------------------------------------------------------
+      #
+      # This will do:
+      #   - auto-create two drive creation
+      #   - boot from created ISO
+      #   - auto-delete two drive
       #
       # Key QEMU controls:
       #   Ctrl+Alt+G: Release mouse/keyboard
@@ -320,12 +419,9 @@
         pkgs = nixpkgs.legacyPackages.x86_64-linux;
         name = "nixos-test-vm";
       in pkgs.writeShellScriptBin "run-vm" ''
-        set -e
         set -euxo pipefail
-
         TMPDIR=$(mktemp -d)
         trap "rm -rf $TMPDIR" EXIT
-
         DISK1="$TMPDIR/disk1.qcow2"
         DISK2="$TMPDIR/disk2.qcow2"
 
@@ -346,8 +442,8 @@
         fi
 
         echo "Creating virtual disks..."
-        ${pkgs.qemu}/bin/qemu-img create -f qcow2 "$DISK1" 11G
-        ${pkgs.qemu}/bin/qemu-img create -f qcow2 "$DISK2" 11G
+        ${pkgs.qemu}/bin/qemu-img create -f qcow2 "$DISK1" 20G
+        ${pkgs.qemu}/bin/qemu-img create -f qcow2 "$DISK2" 20G
 
         echo "Starting QEMU VM with:"
         echo "  ISO: $ISO"
@@ -388,24 +484,13 @@
 
 
       #----------------------------------------------------------------------------
-      # App (shortcut) for running the VM
-      #----------------------------------------------------------------------------
-      #
-      # To start the VM:
-      #   nix run .#vm
-      #   OR
-      #   nix develop -c run-vm
-      #
-      apps.x86_64-linux.vm = {
-        type = "app";
-        program = "${self.packages.x86_64-linux.vm}/bin/run-vm";
-      };
-      #----------------------------------------------------------------------------
-
-
-      #----------------------------------------------------------------------------
       # Configuration to just run the installed NixOS
       #----------------------------------------------------------------------------
+      #
+      # XXX:
+      # This will do:
+      #   - use existing the already created ISO and the already created two drives
+      #   - boot from the ISO
       #
       # Key QEMU controls:
       #   Ctrl+Alt+G: Release mouse/keyboard
@@ -417,10 +502,9 @@
         pkgs = nixpkgs.legacyPackages.x86_64-linux;
         name = "nixos-test-vm";
       in pkgs.writeShellScriptBin "run-with-installed-vm" ''
-        set -euxo pipefail
-        TMPDIR=$(mktemp -d)
-        trap "rm -rf $TMPDIR" EXIT
-
+        #set -euxo pipefail
+        #TMPDIR=$(mktemp -d)
+        #trap "rm -rf $TMPDIR" EXIT
         DISK1="$TMPDIR/disk1.qcow2"
         DISK2="$TMPDIR/disk2.qcow2"
 
@@ -479,22 +563,6 @@
       # To make RAM 4GB: '-m 4096'
       # To disable GUI: replace '-display gtk' with '-nographic'
       # To disable audio: delete '-audiodev' and '-device AC97' lines
-      #----------------------------------------------------------------------------
-
-
-      #----------------------------------------------------------------------------
-      # App (shortcut) for running the vm2 with (suppose) installed NixOS
-      #----------------------------------------------------------------------------
-      #
-      # To start the VM:
-      #   nix run .#vm2
-      #   OR
-      #   nix develop -c run-installed-vm
-      #
-      apps.x86_64-linux.vm2 = {
-        type = "app";
-        program = "${self.packages.x86_64-linux.vm2}/bin/run-installed-vm";
-      };
       #----------------------------------------------------------------------------
 
 
@@ -590,26 +658,6 @@
 
 
       #----------------------------------------------------------------------------
-      # App (shortcut) for the NixOS installer script
-      #----------------------------------------------------------------------------
-      #
-      # Become root
-      #   sudo -i
-      #
-      # Run the ZFS installer
-      #   nix run github:your-username/your-repo#zfs-install
-      #
-      # Or if using the local flake:
-      #   /nix/var/nix/profiles/system/activate/install-zfs-nixos
-      #
-      apps.x86_64-linux.zfs-install = {
-        type = "app";
-        program = "${self.packages.x86_64-linux.zfs-installer}/bin/install-zfs-nixos";
-      };
-      #----------------------------------------------------------------------------
-
-
-      #----------------------------------------------------------------------------
       # Generate and then View documentation
       #----------------------------------------------------------------------------
       #
@@ -634,11 +682,109 @@
       #----------------------------------------------------------------------------
 
 
+      #----------------------------------------------------------------------------
+      # App (shortcut / user command) for running the VM
+      #----------------------------------------------------------------------------
+      #
+      # To start the VM:
+      #   nix run .#vm
+      #   OR
+      #   nix develop -c run-vm
+      #
+      apps.x86_64-linux.vm = {
+        type = "app";
+        program = "${self.packages.x86_64-linux.vm}/bin/run-vm";
+      };
+      #----------------------------------------------------------------------------
+
+
+      #----------------------------------------------------------------------------
+      # App (shortcut / user command) for running the vm2 with (suppose) installed NixOS
+      #----------------------------------------------------------------------------
+      #
+      # To start the VM:
+      #   nix run .#vm2
+      #   OR
+      #   nix develop -c run-installed-vm
+      #
+      apps.x86_64-linux.vm2 = {
+        type = "app";
+        program = "${self.packages.x86_64-linux.vm2}/bin/run-installed-vm";
+      };
+      #----------------------------------------------------------------------------
+
+
+      #----------------------------------------------------------------------------
+      # App (shortcut / user command) for ...
+      #----------------------------------------------------------------------------
+      #
+      # This is my new implimentation
+      #
+
+      # Build ISO
+      apps.x86_64-linux.build-iso = {
+        type = "app"; program = "${self.packages.x86_64-linux.iso}";
+      };
+      # Create two drives
+      apps.x86_64-linux.create-drives = {
+        type = "app"; program = "${self.packages.x86_64-linux.vm-drives}/bin/create-vm-drives";
+      };
+
+      # Start the VM, boot from ISO
+      apps.x86_64-linux.vm-iso = {
+        type = "app"; program = "${self.packages.x86_64-linux.vm-iso}/bin/vm-iso";
+      };
+      # Start the VM, boot from disk
+      apps.x86_64-linux.vm-disk = {
+        type = "app"; program = "${self.packages.x86_64-linux.vm-disk}/bin/vm-disk";
+      };
+
+      # Cleanup
+      apps.x86_64-linux.clean-iso = {
+        type = "app"; program = "${self.packages.x86_64-linux.clean-iso}/bin/clean-iso";
+      };
+      # Cleanup
+      apps.x86_64-linux.clean-disks = {
+        type = "app"; program = "${self.packages.x86_64-linux.clean-disks}/bin/clean-disks";
+      };
+      #----------------------------------------------------------------------------
+
+
+      #----------------------------------------------------------------------------
+      # App (shortcut / user command) for the NixOS installer script
+      #----------------------------------------------------------------------------
+      #
+      # Become root
+      #   sudo -i
+      #
+      # Run the ZFS installer
+      #   nix run github:your-username/your-repo#zfs-install
+      #
+      # Or if using the local flake:
+      #   /nix/var/nix/profiles/system/activate/install-zfs-nixos
+      #
+      apps.x86_64-linux.zfs-install = {
+        type = "app";
+        program = "${self.packages.x86_64-linux.zfs-installer}/bin/install-zfs-nixos";
+      };
+      #----------------------------------------------------------------------------
+
+
+      #----------------------------------------------------------------------------
+      # (Default) App (shortcut / user command)
+      #----------------------------------------------------------------------------
+      #
+      # To run ...
+      #   nix run
+      #   OR
+      #   nix run .#...
+      #
       # nix run
       #apps.default = {
       #  type = "app";
       #  program = "${runVM}/bin/run-zfs-vm";
       #};
+      #----------------------------------------------------------------------------
 
 
     }; # End outputs
