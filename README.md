@@ -20,3 +20,4 @@
 # TODO
 
    - use nix-utils
+   - support multiple custom ISO configurations
